@@ -5,34 +5,115 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"os/exec"
-	"strconv"
-	"sync"
-	"time"
+	"net/http"
+
+	"github.com/go-redis/redis"
+	"github.com/gorilla/pat"
+	"github.com/gorilla/sessions"
+	random_project_generator "github.com/kevinburke/go-random-project-generator"
+	"github.com/markbates/goth"
+	"github.com/markbates/goth/gothic"
+	"github.com/markbates/goth/providers/google"
 )
 
-type GlobalState struct {
-	EndServerState string
-	Lock           sync.Mutex
-	UsersConnected int
-	CachedBanner   []byte
-	ServerList     map[string]interface{}
-	BackendHost    *string
-}
-
-var GState GlobalState
+var host string
+var count = 0
+var clientKey string
+var clientSecret string
+var redirect string
+var domain string
 
 func main() {
-	GState = GlobalState{}
-	GState.EndServerState = "Offline"
 	listenport := flag.String("listen", ":25565", "The port / IP combo you want to listen on")
-	GState.BackendHost = flag.String("backend", "localhost:25567", "The IP address that the MC server listens on when it's online")
+	host = *flag.String("host", "minecraft:25565", "host of server")
+	clientKey = *flag.String("oauth_key", "", "OAuth key")
+	clientSecret = *flag.String("oauth_secret", "", "OAuth Secret")
+	domain = *flag.String("domain", "NOTSETUP", "Domain")
+	redirect = *flag.String("oauth_redirect", "", "OAuth Redirect")
+
 	flag.Parse()
 
-	lis, err := net.Listen("tcp", *listenport)
+	client := redis.NewClient(&redis.Options{
+		Addr:     "redis:6379",
+		Password: "",
+		DB:       0,
+	})
+
+	go minecraftServer(*listenport, client)
+
+	httpServer(client)
+}
+
+func httpServer(client *redis.Client) {
+
+	key := "pizza" // Replace with your SESSION_SECRET or similar
+	maxAge := 86400
+	isProd := false
+
+	store := sessions.NewCookieStore([]byte(key))
+	store.MaxAge(maxAge)
+	store.Options.Path = "/"
+	store.Options.HttpOnly = true // HttpOnly should always be enabled
+	store.Options.Secure = isProd
+
+	gothic.Store = store
+
+	goth.UseProviders(
+		google.New(clientKey, clientSecret, redirect, "email", "profile"),
+	)
+
+	p := pat.New()
+	p.Get("/auth/{provider}/callback", func(res http.ResponseWriter, req *http.Request) {
+		session, _ := store.Get(req, "mc")
+		username := session.Values["user"].(string)
+		user, err := gothic.CompleteUserAuth(res, req)
+		if err != nil {
+			fmt.Fprintln(res, err)
+			return
+		}
+
+		io.WriteString(res, fmt.Sprintf("Email %s & Username %s", user.Email, username))
+		client.Set("user/"+username, user.Email, 0)
+	})
+
+	p.Get("/auth/{loginCode}", func(res http.ResponseWriter, req *http.Request) {
+		loginCode := req.URL.Query().Get(":loginCode")
+		val, err := client.Get("auth/" + loginCode).Result()
+		if err != nil {
+			io.WriteString(res, fmt.Sprintf("Auth key not found"))
+			return
+		}
+		client.Del("auth/" + loginCode)
+		{
+			session, _ := store.Get(req, "mc")
+			session.Values["user"] = val
+			session.Save(req, res)
+		}
+
+		log.Println("Login to", loginCode, "by user", val)
+		q := req.URL.Query()
+		q.Add("provider", "google")
+		req.URL.RawQuery = q.Encode()
+		url, err := gothic.GetAuthURL(res, req)
+		if err != nil {
+			res.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintln(res, err)
+			return
+		}
+
+		http.Redirect(res, req, url, http.StatusTemporaryRedirect)
+	})
+
+	log.Println("listening on localhost:3000")
+	log.Fatal(http.ListenAndServe(":3000", p))
+}
+
+func minecraftServer(listenport string, client *redis.Client) {
+	lis, err := net.Listen("tcp", listenport)
 	LazyHandle(err)
 
 	for {
@@ -41,11 +122,17 @@ func main() {
 			log.Printf("Huh. Unable to accept a connection :( (%s)", err.Error())
 			continue
 		}
-		go HandleConnection(con)
+		go HandleConnection(con, client)
 	}
 }
 
-func HandleConnection(con net.Conn) {
+func LazyHandle(err error) {
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+}
+
+func HandleConnection(con net.Conn, client *redis.Client) {
 	defer con.Close()
 	packet_id := uint(0)
 	data := []byte{}
@@ -61,7 +148,7 @@ func HandleConnection(con net.Conn) {
 		log.Printf("<%s> Received handshake", con.RemoteAddr().String())
 
 		// Protocol version
-		_, bytes_read := ReadVarint(data[i:])
+		protocol, bytes_read := ReadVarint(data[i:])
 		if bytes_read <= 0 {
 			log.Printf("<%s> An error occured when reading protocol version of handshake packet: %d", con.RemoteAddr().String(), bytes_read)
 			return
@@ -82,13 +169,12 @@ func HandleConnection(con net.Conn) {
 
 		// Next state
 		next_state, bytes_read := ReadVarint(data[i:])
-		if (bytes_read <= 0) {
+		if bytes_read <= 0 {
 			log.Printf("<%s> An error occured when reading next state of handshake packet: %d", con.RemoteAddr().String(), bytes_read)
 			return
 		}
 
 		if next_state == 0x01 {
-			// Server list request
 			log.Printf("<%s> Received server list request", con.RemoteAddr().String())
 
 			// Consume request packet
@@ -96,9 +182,21 @@ func HandleConnection(con net.Conn) {
 			if packet_id2 == 0x00 && len(data2) == 0 {
 				log.Printf("<%s> Received request", con.RemoteAddr().String())
 
-				// Generating response
-				server_list_json := GetServerList()
-				response := MakePacket(0x00, MakeString(server_list_json))
+				msg := map[string]interface{}{
+					"version": map[string]interface{}{
+						"name":     "server",
+						"protocol": protocol,
+					},
+					"players": map[string]interface{}{
+						"max":    20,
+						"online": count,
+					},
+					"description": map[string]interface{}{
+						"text": "UMass Makerspace Minecraft Server",
+					},
+				}
+				server_list_json, _ := json.Marshal(msg)
+				response := MakePacket(0x00, MakeString(string(server_list_json)))
 				con.Write(response)
 				log.Printf("<%s> Sent response", con.RemoteAddr().String())
 			}
@@ -117,56 +215,42 @@ func HandleConnection(con net.Conn) {
 				// Done
 				return
 			}
+
 		} else if next_state == 0x02 {
-			// Login request
-			log.Printf("<%s> Received login request", con.RemoteAddr().String())
+			_, data, packet2 := ReadPacket(r)
+			i = 0
+			player_name, r := ReadString(data[i:])
+			i += r
 
-			if GState.EndServerState == "Offline" {
-				GState.Lock.Lock()
-				if GState.EndServerState == "Offline" {
-					GState.EndServerState = "Starting"
-					go RunStartScript()
-					log.Printf("<%s> Server starting, aborting request", con.RemoteAddr().String())
-					con.Write(MakePacket(0x00, MakeString("\"Server is now starting up! Please wait a few minutes before reconnecting.\"")))
+			authpath := random_project_generator.GenerateNumber(1)
+			_, loggedIn := client.Get("user/" + player_name).Result()
+			if loggedIn != nil {
+				err := client.Set("auth/"+authpath, player_name, 0).Err()
+				if err != nil {
+					fmt.Println(err)
 				}
-				GState.Lock.Unlock()
-			}
-			if GState.EndServerState == "Starting" {
-				log.Printf("<%s> Server is still starting, aborting request", con.RemoteAddr().String())
-				con.Write(MakePacket(0x00, MakeString("\"Server is still starting! Please wait before reconnecting.\"")))
+				log.Printf("<%s> Player tried logging in %s, sent to auth %s", con.RemoteAddr().String(), player_name, authpath)
+				con.Write(MakePacket(0x00, MakeString(fmt.Sprintf("\"%s is not associated with a UMass email. Please login at https://%s/auth/%s\"", player_name, domain, authpath))))
 				return
 			}
 
-			// Proceed to relay packets to the real server
-			log.Printf("<%s> Player logging in", con.RemoteAddr().String())
-			Scon, err := net.Dial("tcp", *GState.BackendHost)
+			log.Printf("<%s> Player logging in %s", con.RemoteAddr().String(), player_name)
+			Scon, err := net.Dial("tcp", host)
+			if err != nil {
+				con.Write(MakePacket(0x00, MakeString(fmt.Sprintf("\"Failed to connect to server: %v\"", err))))
+				return
+			}
+			count++
 			defer Scon.Close()
-
-			if err != nil {
-				GState.EndServerState = "Offline"
-				log.Printf("<%s> Error while connecting to the backend server: %s", con.RemoteAddr().String(), err)
-				con.Write(MakePacket(0x00, MakeString("\"Could not connect to the backend server. Please notify the server administrator.\"")))
-				return
-			}
-
-			_, err = Scon.Write(packet)
-			if err != nil {
-				log.Printf("<%s> Error while relaying data to the backend server: %s", con.RemoteAddr().String(), err)
-				con.Write(MakePacket(0x00, MakeString("\"Could not relay data to the backend server. Please notify the server administrator.\"")))
-				return
-			}
-
-			GState.UsersConnected++
-			log.Printf("There are now %d people connected", GState.UsersConnected)
+			Scon.Write(packet)
+			Scon.Write(packet2)
 			go io.Copy(Scon, con)
 			io.Copy(con, Scon)
-			GState.UsersConnected--
-			log.Printf("There are now %d people connected", GState.UsersConnected)
 
-			if GState.UsersConnected == 0 {
-				// Set a reminder to check in 1 min and then shut the server down
-				go KillTimer(1)
-			}
+			log.Println("Player disconnected")
+			count--
+		} else {
+			log.Println("HUH")
 		}
 	}
 }
@@ -203,7 +287,7 @@ func ReadPacket(r *bufio.Reader) (uint, []byte, []byte) {
 	}
 }
 
-func MakePacket(packet_id int, data []byte) ([]byte) {
+func MakePacket(packet_id int, data []byte) []byte {
 	packet := append(MakeVarint(packet_id), data...)
 	return append(MakeVarint(len(packet)), packet...)
 }
@@ -217,7 +301,7 @@ func ReadVarint(data []byte) (int, int) {
 	return int(value), bytes_read
 }
 
-func MakeVarint(value int) ([]byte) {
+func MakeVarint(value int) []byte {
 	temp := make([]byte, 10)
 	bytes_written := binary.PutUvarint(temp, uint64(value))
 	return temp[:bytes_written]
@@ -229,160 +313,10 @@ func ReadString(data []byte) (string, int) {
 		log.Printf("An error occured while reading string: %d", bytes_read)
 		return "", bytes_read
 	}
-	return string(data[bytes_read:bytes_read + length]), bytes_read + length
+	return string(data[bytes_read : bytes_read+length]), bytes_read + length
 }
 
-func MakeString(str string) ([]byte) {
+func MakeString(str string) []byte {
 	data := []byte(str)
 	return append(MakeVarint(len(data)), data...)
-}
-
-func KillTimer(minutes int) {
-	time.Sleep(time.Duration(minutes) * time.Minute)
-
-	if GState.UsersConnected == 0 {
-		log.Printf("Shutting down server due to idle...")
-		cmd := exec.Command("./StopServer")
-		err := cmd.Start()
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Printf("Waiting for command to finish...")
-		err = cmd.Wait()
-		log.Printf("Server offline")
-		GState.EndServerState = "Offline"
-	}
-}
-
-func RunStartScript() {
-	log.Printf("Starting Server Script")
-	cmd := exec.Command("./StartServer")
-	err := cmd.Start()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("Waiting for command to finish...")
-	err = cmd.Wait()
-	log.Printf("Server online")
-	GState.EndServerState = "Online"
-
-	// Set command to shut down server in 5 minutes if no one connects
-	go KillTimer(5)
-}
-
-func LazyHandle(err error) {
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-}
-
-func GetServerList() (string) {
-	if GState.ServerList == nil {
-		// Construct our placeholder server list from scratch
-		GState.ServerList = map[string]interface{} {
-			"version": map[string]interface{} {
-				"name": "unknown",
-				"protocol": 4,
-			},
-			"players": map[string]interface{} {
-				"max": 0,
-				"online": 0,
-			},
-			"description": map[string]interface{} {
-				"text": "Join to initialize description",
-			},
-		}
-	}
-
-	old_motd := GetServerDescription()
-
-	if GState.EndServerState == "Offline" {
-		SetServerDescription(old_motd + " (idle)")
-	} else if GState.EndServerState == "Starting" {
-		SetServerDescription(old_motd + " (starting)")
-	} else if GState.EndServerState == "Online" {
-		// Server is online
-		scon, err := net.Dial("tcp", *GState.BackendHost)
-		LazyHandle(err)
-		r := bufio.NewReader(scon)
-		defer scon.Close()
-
-		if err != nil {
-			GState.EndServerState = "Offline"
-		} else {
-			// Create our own handshake to request the real server list
-			// Protocol version
-			handshake := MakeVarint(4)
-
-			// Address
-			handshake = append(handshake, MakeString("localhost")...)
-
-			// Port
-			_, port_str, _ := net.SplitHostPort(*GState.BackendHost)
-			port, _ := strconv.Atoi(port_str)
-			temp_port := make([]byte, 2)
-			binary.BigEndian.PutUint16(temp_port, uint16(port))
-			handshake = append(handshake, temp_port...)
-
-			// Next state
-			handshake = append(handshake, MakeVarint(1)...)
-
-			// Make packet and send handshake and request
-			handshake = MakePacket(0x00, handshake)
-			scon.Write(handshake)
-
-			request := MakePacket(0x00, nil)
-			scon.Write(request)
-
-			log.Println("Sent server list request to server")
-
-			// Receive data
-			_, data, _ := ReadPacket(r)
-
-			server_list_json, _ := ReadString(data)
-			var json_data interface{}
-			json.Unmarshal([]byte(server_list_json), &json_data)
-
-			// Check if it's a valid server list, otherwise we assume the server is still starting
-			switch json_data.(type) {
-			case map[string]interface{}:
-				// Appears to be valid, update server description
-				log.Println("Received server list response from server")
-				GState.ServerList = json_data.(map[string]interface{})
-				return server_list_json
-			default:
-				// Not a valid response, server is not ready yet
-				SetServerDescription(old_motd + " (readying up)")
-			}
-		}
-	}
-
-	server_list_json, _ := json.Marshal(GState.ServerList)
-
-	// Reset our description again
-	SetServerDescription(old_motd)
-
-	return string(server_list_json)
-}
-
-func GetServerDescription() (string) {
-	switch GState.ServerList["description"].(type) {
-	case string:
-		// In case the description is a string directly
-		return GState.ServerList["description"].(string)
-	default:
-		// In other cases description should be an object that contains text
-		return GState.ServerList["description"].(map[string]interface{})["text"].(string)
-	}
-}
-
-func SetServerDescription(text string) {
-	switch GState.ServerList["description"].(type) {
-	case string:
-		// In case the description is a string directly
-		GState.ServerList["description"] = text
-	default:
-		// In other cases description should be an object that contains text
-		GState.ServerList["description"].(map[string]interface{})["text"] = text
-	}
 }
